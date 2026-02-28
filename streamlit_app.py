@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 
-st.set_page_config(page_title="CBAM Pro Calculator", layout="wide")
+st.set_page_config(page_title="CBAM Calculator PRO", layout="wide")
 
 st.title("🌱 Calcolatore CBAM Intelligente")
 
@@ -10,101 +10,121 @@ st.title("🌱 Calcolatore CBAM Intelligente")
 @st.cache_data
 def load_data():
     if os.path.exists('db_benchmarks.csv') and os.path.exists('db_defaults.csv'):
-        return pd.read_csv('db_benchmarks.csv'), pd.read_csv('db_defaults.csv')
+        return pd.read_csv('db_benchmarks.csv', dtype={'HS_Code': str}), pd.read_csv('db_defaults.csv', dtype={'HS_Code': str})
     return None, None
 
 df_bm, df_def = load_data()
 
 if df_bm is None:
-    st.error("Database non trovati! Carica 'db_benchmarks.csv' e 'db_defaults.csv'.")
+    st.error("⚠️ Database non trovati! Assicurati di aver caricato 'db_benchmarks.csv' e 'db_defaults.csv'.")
     st.stop()
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("📦 Input Merce")
-    hs_code = st.text_input("Codice HS (es. 72024910)", "72024910").strip()
-    paese = st.text_input("Paese di Origine", "China").strip()
-    anno = st.selectbox("Anno", [2026, 2027, 2028, 2029, 2030])
-    volume = st.number_input("Volume (t)", value=1.0)
+    st.header("📦 Dati Importazione")
+    hs_input = st.text_input("Codice HS (es. 72024910)", "72024910").strip()
+    paese_input = st.text_input("Paese di Origine (es. China)", "China").strip()
+    anno = st.selectbox("Anno di riferimento", [2026, 2027, 2028, 2029, 2030])
+    volume = st.number_input("Volume importato (tonnellate)", value=1.0, min_value=0.0)
 
-    st.header("⚙️ Metodo Emissioni")
-    tipo_input = st.radio("Scegli:", ["Dati Reali (A)", "Valori Default (B)", "Rotta Specifica (C-J)"])
+    st.header("⚙️ Emissioni")
+    metodo = st.radio("Metodo:", ["Dati Reali (Tag A)", "Valori Default (Tag B)", "Rotte Acciaio (C-J)"])
     
     emiss_reali = 0.0
     tag_scelto = ""
-    if tipo_input == "Dati Reali (A)":
-        emiss_reali = st.number_input("TCO2 reali", value=3.157, format="%.4f")
+    if metodo == "Dati Reali (Tag A)":
+        emiss_reali = st.number_input("Inserisci TCO2/t reali", value=3.157, format="%.4f")
         tag_scelto = "A"
-    elif tipo_input == "Valori Default (B)":
+    elif metodo == "Valori Default (Tag B)":
         tag_scelto = "B"
     else:
-        tag_scelto = st.selectbox("Rotta:", ["C", "D", "E", "F", "G", "H", "J"])
+        tag_scelto = st.selectbox("Seleziona Rotta:", ["C", "D", "E", "F", "G", "H", "J"])
 
-    st.header("💰 Parametri")
+    st.header("💰 Parametri Economici")
     prezzo_ets = st.number_input("Prezzo ETS (€)", value=75.0)
-    fa_default = 97.5 if anno <= 2026 else (95.0 if anno == 2027 else 90.0)
-    free_all = st.number_input("Free Allowance (%)", value=fa_default)
+    fa_perc = st.number_input("Free Allowance Factor (%)", value=97.5)
 
-# --- LOGICA DI RICERCA AUTOMATICA ---
+# --- FUNZIONI DI RICERCA INTELLIGENTE ---
 
-def find_benchmark(hs, tag, year):
+def get_benchmark(hs, tag, year):
     periodo = "1" if year <= 2027 else "2"
-    # Filtro HS
-    subset = df_bm[df_bm['HS_Code'].astype(str) == hs]
+    # Filtro HS esatto
+    subset = df_bm[df_bm['HS_Code'] == hs]
     
-    # 1. Prova match esatto: Tag + Periodo (es. A e 1)
-    res = subset[(subset['Route_Tag'] == tag) & (subset['Year_Period'].astype(str) == periodo)]
-    if not res.empty: return res['Benchmark_Value'].values[0]
-    
-    # 2. Prova solo Tag (es. solo A)
-    res = subset[subset['Route_Tag'] == tag]
-    if not res.empty: return res['Benchmark_Value'].values[0]
-    
-    # 3. Fallback sul Periodo (es. solo 1) - MOLTO COMUNE
-    res = subset[subset['Year_Period'].astype(str) == periodo]
-    if not res.empty: return res['Benchmark_Value'].values[0]
-    
-    return 0.0
+    # Se non trova l'HS a 8 cifre, prova a cercarlo come prefisso (6 o 4 cifre)
+    if subset.empty:
+        subset = df_bm[df_bm['HS_Code'].apply(lambda x: hs.startswith(str(x)))]
 
-def find_default(hs, country, year):
-    col = 'V2026' if year == 2026 else ('V2027' if year == 2027 else 'V2028')
+    if subset.empty: return 0.0
+
+    # 1. Prova Match Tag + Anno
+    match = subset[(subset['Tag'] == tag) & (subset['Year'].astype(str) == periodo)]
+    if not match.empty: return match['Value'].values[0]
+
+    # 2. Prova solo Tag
+    match = subset[subset['Tag'] == tag]
+    if not match.empty: return match['Value'].values[0]
+
+    # 3. Fallback solo Anno (molto comune per ferro/acciaio)
+    match = subset[subset['Year'].astype(str) == periodo]
+    if not match.empty: return match['Value'].values[0]
+
+    # 4. Ultima spiaggia: primo valore disponibile
+    return subset['Value'].values[0]
+
+def get_default_emission(hs, country, year):
+    col_anno = f"V{min(year, 2028)}" # Usa 2028 per anni successivi
     
-    # Ricerca a ritroso (8 cifre -> 6 -> 4)
-    for length in [8, 6, 4]:
-        hs_pref = hs[:length]
-        # Cerco per paese
-        match = df_def[(df_def['Country'] == country) & (df_def['HS_Code'].astype(str).str.startswith(hs_pref))]
-        
-        # Se trovo righe ma il valore è vuoto, o non trovo nulla, provo "Other Countries"
-        if not match.empty and pd.notna(match[col].values[0]):
-            return match[col].values[0]
+    # Liste di tentativi: Paese specifico e poi "Other Countries"
+    paesi_da_provare = [country, "Other Countries and Territories", "Other"]
+    
+    for p in paesi_da_provare:
+        # Cerca per lunghezze HS decrescenti (8, 6, 4)
+        for length in [8, 6, 4]:
+            hs_pref = hs[:length]
+            match = df_def[(df_def['Country'].str.contains(p, case=False, na=False)) & 
+                           (df_def['HS_Code'].astype(str) == hs_pref)]
             
-    # Fallback finale su "Other Countries"
-    match_other = df_def[(df_def['Country'].str.contains('Other', case=False)) & (df_def['HS_Code'].astype(str).str.startswith(hs[:4]))]
-    if not match_other.empty:
-        return match_other[col].values[0]
-    
+            if not match.empty:
+                val = match[col_anno].values[0]
+                if pd.notna(val) and val > 0:
+                    return val
     return 0.0
 
-# --- ESECUZIONE ---
-if st.button("CALCOLA"):
-    bm_val = find_benchmark(hs_code, tag_scelto, anno)
+# --- CALCOLO E DISPLAY ---
+if st.button("CALCOLA CBAM"):
+    # Recupero valori
+    bm_val = get_benchmark(hs_input, tag_scelto, anno)
     
-    if tipo_input == "Dati Reali (A)":
-        emiss_val = emiss_reali
+    if metodo == "Dati Reali (Tag A)":
+        em_val = emiss_reali
     else:
-        emiss_val = find_default(hs_code, paese, anno)
-    
-    # Calcolo
-    gap = emiss_val - (bm_val * (free_all / 100))
-    totale = max(0, gap * prezzo_ets * volume)
+        em_val = get_default_emission(hs_input, paese_input, anno)
 
-    # UI
+    # Formula
+    fa_factor = fa_perc / 100
+    gap = em_val - (bm_val * fa_factor)
+    costo_unitario = max(0, gap * prezzo_ets)
+    totale = costo_unitario * volume
+
+    # Interfaccia Risultati
     st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Emissione applicata", f"{emiss_val:.3f}")
-    c2.metric("Benchmark trovato", f"{bm_val:.3f}")
-    c3.metric("Totale CBAM", f"€ {totale:,.2f}")
+    col1, col2, col3 = st.columns(3)
     
-    if emiss_val == 0:
-        st.warning("⚠️ Attenzione: Valore di default non trovato per questo codice HS/Paese.")
+    with col1:
+        st.metric("Emissione (E)", f"{em_val:.4f} tCO2/t")
+        st.caption(f"Fonte: {'Manuale' if metodo == 'Dati Reali (Tag A)' else 'Database Default'}")
+        
+    with col2:
+        st.metric("Benchmark (B)", f"{bm_val:.4f}")
+        st.caption(f"Tag usato: {tag_scelto if tag_scelto else 'Generale'} | Anno: {anno}")
+
+    with col3:
+        st.metric("TOTALE DA PAGARE", f"€ {totale:,.2f}", delta=f"€ {costo_unitario:.2f} / t", delta_color="inverse")
+
+    # Spiegazione Formula
+    st.info(f"**Calcolo effettuato:** ({em_val:.4f} - ({bm_val:.4f} * {fa_factor})) * {prezzo_ets} €/t = **€ {costo_unitario:.2f} per tonnellata**")
+
+    if em_val == 0:
+        st.warning("⚠️ Non ho trovato valori di default per questo codice HS. Controlla il codice o inserisci dati reali.")
+
