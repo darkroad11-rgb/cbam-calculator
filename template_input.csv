@@ -1,0 +1,4 @@
+hs_code,country_origin,year,quantity_tons,actual_emissions_tco2_t,production_route_letter,ets_price_eur,free_allowance_perc
+72024910,China,2026,100,0,A,80,97.5
+25231000,Albania,2026,50,0,B,80,97.5
+72131000,Turkey,2028,200,0,C,80,95.0
