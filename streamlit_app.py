@@ -1,84 +1,87 @@
+import streamlit as st
 import pandas as pd
 import os
 
-# --- LOGICA DI CALCOLO CBAM ---
+# Configurazione Pagina
+st.set_page_config(page_title="Calcolatore CBAM", layout="wide")
 
-def calcola_cbam():
-    # 1. Caricamento Dati
-    try:
-        df_bm = pd.read_csv('db_benchmarks.csv')
-        df_def = pd.read_csv('db_defaults.csv')
-        inputs = pd.read_csv('template_input.csv')
-    except FileNotFoundError:
-        print("Errore: Assicurati che db_benchmarks.csv, db_defaults.csv e template_input.csv siano nella cartella.")
-        return
+st.title("🌱 Applicazione Calcolo CBAM")
+st.markdown("Strumento per il calcolo delle emissioni incorporate e dei certificati CBAM.")
 
-    risultati = []
+# --- FUNZIONE DI CARICAMENTO DATI ---
+@st.cache_data
+def load_databases():
+    if not os.path.exists('db_benchmarks.csv') or not os.path.exists('db_defaults.csv'):
+        return None, None
+    df_bm = pd.read_csv('db_benchmarks.csv')
+    df_def = pd.read_csv('db_defaults.csv')
+    return df_bm, df_def
 
-    for _, row in inputs.iterrows():
-        hs = str(row['hs_code']).strip()
-        paese = row['country_origin']
-        anno = int(row['year'])
-        qta = row['quantity_tons']
-        emiss_reali = row['actual_emissions_tco2_t']
-        rotta = str(row['production_route_letter']).strip().upper()
-        prezzo_ets = row['ets_price_eur']
-        free_allowance = row['free_allowance_perc'] / 100
+df_bm, df_def = load_databases()
 
-        # --- A. DETERMINAZIONE BENCHMARK ---
-        # Filtro per codice HS e rotta (A, B, C, D, etc.)
-        bm_hs = df_bm[df_bm['HS_Code'].astype(str) == hs]
+if df_bm is None:
+    st.error("❌ Errore: File database non trovati!")
+    st.info("Assicurati di aver caricato 'db_benchmarks.csv' e 'db_defaults.csv' nella cartella principale.")
+    st.stop()
+
+# --- INTERFACCIA DI INPUT ---
+with st.sidebar:
+    st.header("Parametri di Calcolo")
+    hs_code = st.text_input("Codice HS (8 cifre)", "72024910")
+    paese = st.text_input("Paese di Origine", "China")
+    anno = st.selectbox("Anno di riferimento", [2026, 2027, 2028, 2029, 2030])
+    volume = st.number_input("Volume importato (tonnellate)", value=1.0, min_value=0.0)
+    
+    st.subheader("Emissioni")
+    tipo_emiss = st.radio("Tipo di Dati", ["Default", "Reali (Tag A)"])
+    emiss_reali = 0.0
+    if tipo_emiss == "Reali (Tag A)":
+        emiss_reali = st.number_input("TCO2 dirette reali (per tn)", value=0.0)
+        rotta_scelta = "A"
+    else:
+        rotta_scelta = st.selectbox("Production Route (Tag)", 
+                                   ["B", "C", "D", "E", "F", "G", "H", "J"],
+                                   help="B=Default, C-J=Rotte specifiche acciaio")
+
+    ets_price = st.number_input("Prezzo ETS (€/tCO2)", value=80.0)
+    free_all = st.slider("Free Allowance (%)", 0.0, 100.0, 97.5)
+
+# --- LOGICA DI CALCOLO ---
+if st.button("Calcola Risultato"):
+    # 1. Trova Benchmark
+    bm_hs = df_bm[df_bm['HS_Code'].astype(str) == str(hs_code)]
+    periodo = '1' if anno <= 2027 else '2'
+    
+    match_bm = bm_hs[(bm_hs['Route_Tag'] == rotta_scelta) & (bm_hs['Year_Period'].astype(str) == periodo)]
+    if match_bm.empty:
+        match_bm = bm_hs[bm_hs['Route_Tag'] == rotta_scelta]
+    
+    valore_bm = match_bm['Benchmark_Value'].values[0] if not match_bm.empty else 0
+
+    # 2. Trova Emissioni
+    if emiss_reali > 0:
+        valore_emissione = emiss_reali
+        is_default = False
+    else:
+        filtro_def = df_def[(df_def['Country'] == paese) & (df_def['HS_Code'].astype(str) == str(hs_code))]
+        if filtro_def.empty:
+            filtro_def = df_def[(df_def['Country'].str.contains('Other', case=False)) & (df_def['HS_Code'].astype(str) == str(hs_code))]
         
-        # Gestione Anno per Benchmark: (1) per 2026-27, (2) per 2028-30
-        periodo = '1' if anno <= 2027 else '2'
-        
-        # Cerco il benchmark specifico per rotta e periodo
-        match_bm = bm_hs[(bm_hs['Route_Tag'] == rotta) & (bm_hs['Year_Period'].astype(str) == periodo)]
-        if match_bm.empty:
-            # Fallback se non c'è distinzione di anno
-            match_bm = bm_hs[bm_hs['Route_Tag'] == rotta]
-        
-        valore_bm = match_bm['Benchmark_Value'].values[0] if not match_bm.empty else 0
+        col_anno = 'V2026' if anno == 2026 else ('V2027' if anno == 2027 else 'V2028')
+        valore_emissione = filtro_def[col_anno].values[0] if not filtro_def.empty else 0
+        is_default = True
 
-        # --- B. DETERMINAZIONE EMISSIONI ---
-        # Se emissione reale è 0 o vuota, cerco nei default
-        if pd.isna(emiss_reali) or emiss_reali <= 0:
-            # Cerco per Paese e Codice HS
-            filtro_def = df_def[(df_def['Country'] == paese) & (df_def['HS_Code'].astype(str) == hs)]
-            
-            # Fallback: Se non trovo il paese, cerco "Other Countries"
-            if filtro_def.empty:
-                filtro_def = df_def[(df_def['Country'].str.contains('Other', case=False)) & (df_def['HS_Code'].astype(str) == hs)]
-            
-            # Scelta colonna anno (2026, 2027, 2028+)
-            col_anno = 'V2026' if anno == 2026 else ('V2027' if anno == 2027 else 'V2028')
-            
-            valore_emissione = filtro_def[col_anno].values[0] if not filtro_def.empty else 0
-            tipo_emiss = "Default"
-        else:
-            valore_emissione = emiss_reali
-            tipo_emiss = "Reale"
+    # 3. Calcolo
+    gap = max(0, valore_emissione - (valore_bm * (free_all / 100)))
+    costo_tn = gap * ets_price
+    totale = costo_tn * volume
 
-        # --- C. CALCOLO COSTO ---
-        # Formula: (Emissioni - (Benchmark * Free Allowance)) * Prezzo ETS * Quantità
-        gap = max(0, valore_emissione - (valore_bm * free_allowance))
-        costo_totale = gap * prezzo_ets * qta
+    # --- MOSTRA RISULTATI ---
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Emissione Usata", f"{valore_emissione:.3f} tCO2/t", "Default" if is_default else "Reale")
+    c2.metric("Benchmark", f"{valore_bm:.3f}")
+    c3.metric("Totale da Pagare", f"€ {totale:,.2f}")
 
-        risultati.append({
-            'HS Code': hs,
-            'Paese': paese,
-            'Anno': anno,
-            'Tipo Emissione': tipo_emiss,
-            'Emissione Usata': valore_emissione,
-            'Benchmark Usato': valore_bm,
-            'Costo Totale CBAM (€)': round(costo_totale, 2)
-        })
+    st.info(f"Dettaglio: Gap emissioni di {gap:.3f} tCO2/t moltiplicato per {volume} tonnellate.")
 
-    # Salvataggio Risultati
-    df_output = pd.DataFrame(risultati)
-    df_output.to_csv('risultati_finali_cbam.csv', index=False)
-    print("Calcolo completato! Apri 'risultati_finali_cbam.csv' per vedere i dettagli.")
-
-if __name__ == "__main__":
-    calcola_cbam()
 
