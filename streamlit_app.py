@@ -1,87 +1,133 @@
 import pandas as pd
-import numpy as np
+import re
+import os
 
-def calculate_cbam():
-    # Caricamento database
-    benchmarks = pd.read_csv('cbam_benchmarks_final.csv')
-    defaults = pd.read_csv('cbam_defaults_final.csv')
-    inputs = pd.read_csv('cbam_input_template.csv')
+# --- CONFIGURAZIONE NOMI FILE ---
+# Assicurati che questi nomi corrispondano esattamente ai file nella tua cartella
+FILE_BENCHMARKS = "carboneer-20251217-cbam-defaults-benchmarks.xlsx - cbam-benchmarks.csv"
+FILE_DEFAULTS = "carboneer-20251217-cbam-defaults-benchmarks.xlsx - cbam-default-values.csv"
+FILE_INPUT = "cbam_input_da_compilare.csv"
 
+def pulisci_e_prepara_dati():
+    print("Fase 1: Pulizia dati in corso...")
+    
+    # Pulizia Benchmarks
+    df_bm = pd.read_csv(FILE_BENCHMARKS)
+    cleaned_bm = []
+    current_sector = "Unknown"
+    
+    for _, row in df_bm.iterrows():
+        cn = str(row['CN code']).strip()
+        val_b = str(row['Column B']).strip()
+        
+        if cn != 'nan' and val_b == 'nan':
+            current_sector = cn
+            continue
+        if cn == 'nan' or val_b == 'nan': continue
+        
+        # Estrazione valore e tag (es: "0,666 (A)" -> 0.666, A)
+        match = re.search(r"([0-9,]+)\s*(?:\((.*)\))?", val_b)
+        if match:
+            num = float(match.group(1).replace(',', '.'))
+            tag_completo = match.group(2) if match.group(2) else ""
+            
+            # Gestione tag composti tipo F)(1
+            main_tag = tag_completo
+            year_tag = ""
+            if ')(' in tag_completo:
+                parts = tag_completo.split(')(')
+                main_tag, year_tag = parts[0], parts[1]
+            elif tag_completo in ['1', '2']:
+                main_tag, year_tag = "", tag_completo
+                
+            cleaned_bm.append({
+                'CN_code': cn, 'Value': num, 'Main_Tag': main_tag, 'Year_Tag': year_tag
+            })
+    
+    df_bm_final = pd.DataFrame(cleaned_bm)
+
+    # Pulizia Default Values
+    df_def = pd.read_csv(FILE_DEFAULTS)
+    cols_to_fix = ['2026 Default Value (Including mark-up)', 
+                   '2027 Default Value (Including mark-up)', 
+                   '2028 Default Value (Including mark-up)']
+    
+    for col in cols_to_fix:
+        df_def[col] = pd.to_numeric(df_def[col].astype(str).str.replace(',', '.'), errors='coerce')
+    
+    return df_bm_final, df_def
+
+def crea_template_se_manca():
+    if not os.path.exists(FILE_INPUT):
+        template = pd.DataFrame({
+            'hs_code': ['72024910'],
+            'country_origin': ['China'],
+            'year': [2026],
+            'volume_tn': [1.0],
+            'actual_emissions_tco2': [0], # Lascia 0 per usare i Default
+            'production_route_tag': ['A'], # A, B, C, D, E, F, G, H, J
+            'ets_price': [75.0],
+            'free_allowance_perc': [97.5]
+        })
+        template.to_csv(FILE_INPUT, index=False)
+        print(f"--> Creato file '{FILE_INPUT}'. Compilalo con i tuoi dati e riavvia lo script.")
+        return True
+    return False
+
+def esegui_calcolo(df_bm, df_def):
+    print("Fase 2: Calcolo in corso...")
+    inputs = pd.read_csv(FILE_INPUT)
     results = []
 
     for _, row in inputs.iterrows():
-        hs_code = str(row['hs_code'])
+        hs = str(row['hs_code'])
+        yr = int(row['year'])
         country = row['country_origin']
-        year = int(row['year'])
-        actual_emissions = row['actual_direct_emissions_tco2_tn']
-        route_tag = str(row['production_route_tag']).strip()
-        volume = row['volume_imported_tn']
-        ets_price = row['ets_price_eur']
-        free_allowance_perc = row['free_allowance_perc'] / 100
-
-        # 1. Determinazione Benchmark
-        # Filtro per codice HS e Tag di produzione (A, B, C, D, etc.)
-        bm_subset = benchmarks[benchmarks['CN_code'] == hs_code]
+        route = str(row['production_route_tag'])
         
-        # Logica Anno per Benchmark (1=2026-27, 2=2028-30)
-        year_tag = '1' if year <= 2027 else '2'
+        # 1. Trova Benchmark
+        yr_tag = '1' if yr <= 2027 else '2'
+        bm_match = df_bm[(df_bm['CN_code'] == hs) & (df_bm['Main_Tag'] == route)]
         
-        # Cerchiamo il benchmark che corrisponde al tag e al periodo
-        match = bm_subset[
-            (bm_subset['Main_Tag'] == route_tag) & 
-            ((bm_subset['Year_Tag'] == year_tag) | (bm_subset['Year_Tag'].isna()) | (bm_subset['Year_Tag'] == ''))
-        ]
-        
-        if match.empty:
-            # Fallback su tag generico se specifico non trovato
-            match = bm_subset[bm_subset['Main_Tag'] == route_tag]
-            
-        benchmark_val = match['Benchmark_Value'].values[0] if not match.empty else 0
-
-        # 2. Determinazione Emissioni (Reali o Default)
-        if pd.isna(actual_emissions) or actual_emissions == 0:
-            # Cerca nei default per paese e codice HS
-            def_row = defaults[(defaults['Country'] == country) & (defaults['Product CN Code'] == int(hs_code))]
-            
-            # Fallback su "Other Countries"
-            if def_row.empty:
-                def_row = defaults[(defaults['Country'].str.contains('Other Countries', case=False)) & 
-                                   (defaults['Product CN Code'] == int(hs_code))]
-            
-            # Selezione colonna anno
-            if year == 2026:
-                col_name = '2026 Default Value (Including mark-up)'
-            elif year == 2027:
-                col_name = '2027 Default Value (Including mark-up)'
-            else: # 2028+
-                col_name = '2028 Default Value (Including mark-up)'
-            
-            emissions_to_use = def_row[col_name].values[0] if not def_row.empty else 0
-            is_default_used = True
+        # Filtro per anno se esiste
+        bm_yr = bm_match[bm_match['Year_Tag'] == yr_tag]
+        if not bm_yr.empty:
+            bm_val = bm_yr['Value'].values[0]
+        elif not bm_match.empty:
+            bm_val = bm_match['Value'].values[0]
         else:
-            emissions_to_use = actual_emissions
-            is_default_used = False
+            bm_val = 0
 
-        # 3. Calcolo Finale (Formula basata sul tuo esempio Excel)
-        # Costo = Volume * (Emissioni - Benchmark * Free_Allowance) * Prezzo_ETS
-        emissions_gap = max(0, emissions_to_use - (benchmark_val * free_allowance_perc))
-        cbam_cost_per_tn = emissions_gap * ets_price
-        total_to_pay = cbam_cost_per_tn * volume
+        # 2. Trova Emissioni (Reali o Default)
+        if row['actual_emissions_tco2'] > 0:
+            emiss_val = row['actual_emissions_tco2']
+            tipo = "Reale"
+        else:
+            col_anno = f'{yr} Default Value (Including mark-up)'
+            def_match = df_def[(df_def['Country'] == country) & (df_def['Product CN Code'].astype(str) == hs)]
+            if def_match.empty: # Fallback Other Countries
+                def_match = df_def[(df_def['Country'].str.contains('Other')) & (df_def['Product CN Code'].astype(str) == hs)]
+            
+            emiss_val = def_match[col_anno].values[0] if not def_match.empty else 0
+            tipo = "Default"
+
+        # 3. Formula CBAM
+        gap = max(0, emiss_val - (bm_val * (row['free_allowance_perc']/100)))
+        costo_totale = gap * row['ets_price'] * row['volume_tn']
 
         results.append({
-            'HS Code': hs_code,
-            'Year': year,
-            'Emissions Used': emissions_to_use,
-            'Is Default': is_default_used,
-            'Benchmark Used': benchmark_val,
-            'CBAM Cost/tn': cbam_cost_per_tn,
-            'Total to Pay': total_to_pay
+            'HS Code': hs, 'Paese': country, 'Tipo Emissione': tipo,
+            'Valore Emissione': emiss_val, 'Benchmark': bm_val, 'Totale da Pagare (€)': costo_totale
         })
 
-    # Salvataggio risultati
-    df_results = pd.DataFrame(results)
-    df_results.to_csv('cbam_results.csv', index=False)
-    print("Calcolo completato! Risultati salvati in 'cbam_results.csv'")
+    pd.DataFrame(results).to_csv("risultati_cbam.csv", index=False)
+    print("--> Fatto! Risultati salvati in 'risultati_cbam.csv'")
 
+# ESECUZIONE
 if __name__ == "__main__":
-    calculate_cbam()
+    if not os.path.exists(FILE_BENCHMARKS) or not os.path.exists(FILE_DEFAULTS):
+        print("ERRORE: I file Excel/CSV originali non sono nella cartella!")
+    else:
+        df_bm, df_def = pulisci_e_prepara_dati()
+        if not crea_template_se_manca():
+            esegui_calcolo(df_bm, df_def)
